@@ -377,6 +377,24 @@ def _to_live_parts(contents) -> list:
         if isinstance(item, str):
             parts.append({"text": item})
             continue
+        # PIL images arrive from capture/file_processor call sites. Convert
+        # them to inline_data here so the Live rung can actually see them
+        # instead of silently dropping the frame and answering "no image".
+        try:
+            import PIL.Image
+            if isinstance(item, PIL.Image.Image):
+                import io, base64
+                buf = io.BytesIO()
+                fmt = (item.format or "PNG")
+                item.save(buf, format=fmt)
+                data = base64.b64encode(buf.getvalue()).decode("ascii")
+                mime = "image/" + fmt.lower()
+                if mime == "image/jpg":
+                    mime = "image/jpeg"
+                parts.append({"inline_data": {"mime_type": mime, "data": data}})
+                continue
+        except Exception:
+            pass
         blob = getattr(item, "inline_data", None)
         if blob is not None:
             data = getattr(blob, "data", None)

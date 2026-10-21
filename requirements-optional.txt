@@ -1,0 +1,7 @@
+# Optional heavy dependencies for Mark LVI
+pandas
+pydub
+mediapipe
+faster-whisper
+piper-tts
+openwakeword

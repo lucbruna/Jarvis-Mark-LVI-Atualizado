@@ -81,7 +81,15 @@ class WhisperSTT:
     def __init__(self, cfg: dict):
         self.backend = (cfg.get("backend") or "local").strip().lower()
         self.model_name = (cfg.get("model") or DEFAULT_MODEL).strip()
-        self.device = (cfg.get("device") or "cpu").strip().lower()
+        raw_dev = (cfg.get("device") or "cpu").strip().lower()
+        if raw_dev == "auto":
+            try:
+                import torch
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                self.device = "cpu"
+        else:
+            self.device = raw_dev
         self.language = (cfg.get("language") or "").strip()
         self.base_url = (cfg.get("base_url") or "").strip()
         self.api_key = (cfg.get("api_key") or "").strip()
@@ -331,7 +339,7 @@ PROVIDER = {
         Field("model", "Model", kind="choice", choices=MODELS,
               default=DEFAULT_MODEL,
               hint="base is the fast default; small is more accurate and slower"),
-        Field("device", "Processor", kind="choice", choices=("cpu", "cuda"),
+        Field("device", "Processor", kind="choice", choices=("auto", "cpu", "cuda"),
               default="cpu", required=False, advanced=True,
               hint="CPU is the default and needs no graphics card"),
         Field("language", "Language", default="", required=False, advanced=True,

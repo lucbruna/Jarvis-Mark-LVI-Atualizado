@@ -49,6 +49,17 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     HAVE_VIDEO = False
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
+# The Earth view is software rendered (numpy + QPainter), so it needs no
+# multimedia plugin — only numpy, which the vision path already requires. Same
+# rule as above: absent means one feature reports itself, not a dead assistant.
+try:
+    from core.globe import GlobeWidget
+    HAVE_GLOBE = True
+except Exception as _ge:          # noqa: BLE001 - reported, never fatal
+    GlobeWidget = None
+    HAVE_GLOBE = False
+    print(f"[Globe] Earth view unavailable ({_ge}).")
+
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
@@ -1732,6 +1743,22 @@ class CustomizeOverlay(QWidget):
         self._hex_input.textEdited.connect(self._on_hex_edited)
         lay.addWidget(self._hex_input)
 
+        # ── Unrestricted mode toggle ─────────────────────────────────────────
+        lay.addSpacing(6)
+        from memory.config_manager import get_unrestricted_mode
+        self._unlocked_toggle = QPushButton()
+        self._unlocked_toggle.setCheckable(True)
+        self._unlocked_toggle.setChecked(get_unrestricted_mode())
+        self._unlocked_toggle.setFixedHeight(28)
+        self._unlocked_toggle.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._unlocked_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._style_unlocked(self._unlocked_toggle)
+        self._unlocked_toggle.toggled.connect(
+            lambda _: self._style_unlocked(self._unlocked_toggle))
+        lay.addWidget(_lbl("UNRESTRICTED MODE  (disable safety guards)", 8,
+                           color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft))
+        lay.addWidget(self._unlocked_toggle)
+
         lay.addSpacing(6)
         btn_row = QHBoxLayout(); btn_row.setSpacing(8)
 
@@ -1824,9 +1851,24 @@ class CustomizeOverlay(QWidget):
             self.on_preview(self._initial_color)
         self.hide()
 
+    def _style_unlocked(self, btn: QPushButton):
+        on = btn.isChecked()
+        btn.setText("ON  (unrestricted)" if on else "OFF  (safe)")
+        if on:
+            btn.setStyleSheet(f"QPushButton {{ background: rgba(255,60,60,40); color: {C.RED}; "
+                              f"border: 1px solid {C.RED}; border-radius: 3px; }}")
+        else:
+            btn.setStyleSheet(f"QPushButton {{ background: transparent; color: {C.TEXT_MED}; "
+                              f"border: 1px solid {C.BORDER}; border-radius: 3px; }}")
+
     def _save(self):
         name = self._name_input.text().strip() or "JARVIS"
         user = self._user_input.text().strip()
+        try:
+            from memory.config_manager import save_unrestricted_mode
+            save_unrestricted_mode(self._unlocked_toggle.isChecked())
+        except Exception:
+            pass
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
 
@@ -2042,6 +2084,108 @@ class ConfirmBanner(_HudOverlay):
         # safe answer wins.
         no.setDefault(True)
         no.setFocus()
+
+
+class PermissionBanner(_HudOverlay):
+    """A refusal the person has to act on, with the control that acts on it.
+
+    Deliberately separate from ConfirmBanner even though they look alike: a
+    confirmation asks "may I?" and its answer is yes or no, while this reports
+    something that ALREADY failed and offers the one fix that covers the whole
+    class — running the assistant with administrator rights. Sharing a widget
+    would have meant a class that behaves differently depending on a flag.
+
+    The button is a human's to press. The model cannot reach it, for the same
+    reason core/confirm.py exists: a permission request the assistant can
+    approve itself is not a permission request.
+    """
+
+    elevate_requested = pyqtSignal()
+    dismissed = pyqtSignal()
+    _OW = 470
+
+    def __init__(self, title: str, detail: str, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            PermissionBanner {{
+                background: rgba(20, 4, 0, 252);
+                border: 1px solid {C.RED};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 16, 20, 16)
+        lay.setSpacing(8)
+
+        hdr = QLabel("\u26a0  PERMISS\u00c3O NEGADA")
+        hdr.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.RED}; background: transparent;")
+        lay.addWidget(hdr)
+
+        ttl = QLabel(title)
+        ttl.setWordWrap(True)
+        ttl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        ttl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(ttl)
+
+        if detail:
+            dtl = QLabel(detail)
+            dtl.setWordWrap(True)
+            dtl.setFont(QFont("Courier New", 8))
+            dtl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(dtl)
+
+        try:
+            from core.permissions import can_elevate
+            _elevatable = can_elevate()
+        except Exception:
+            _elevatable = False
+
+        hint = QLabel(
+            "O Windows bloqueou esta a\u00e7\u00e3o. Reabrir o assistente como "
+            "administrador resolve a maioria dos casos \u2014 a sess\u00e3o atual "
+            "ser\u00e1 encerrada."
+            if _elevatable else
+            "O sistema bloqueou esta a\u00e7\u00e3o. Execute o assistente com mais "
+            "privil\u00e9gios para permitir isto."
+        )
+        hint.setWordWrap(True)
+        hint.setFont(QFont("Courier New", 8))
+        hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        lay.addWidget(hint)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+
+        if _elevatable:
+            up = QPushButton("\U0001f513  ABRIR COMO ADMINISTRADOR")
+            up.setFixedHeight(32)
+            up.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            up.setCursor(Qt.CursorShape.PointingHandCursor)
+            up.setToolTip("Reabre o assistente com direitos de administrador "
+                          "(UAC do Windows).")
+            up.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {C.RED};
+                    border: 1px solid {C.RED}; border-radius: 3px; }}
+                QPushButton:hover {{ background: rgba(255,60,60,40); }}
+            """)
+            up.clicked.connect(lambda: self.elevate_requested.emit())
+            row.addWidget(up)
+
+        close = QPushButton("FECHAR")
+        close.setFixedHeight(32)
+        close.setFont(QFont("Courier New", 9))
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        close.clicked.connect(lambda: self.dismissed.emit())
+        row.addWidget(close)
+        lay.addLayout(row)
 
 
 class AudioDeviceOverlay(_HudOverlay):
@@ -4246,9 +4390,14 @@ class MainWindow(QMainWindow):
     _wake_btns_sig   = pyqtSignal()          # wake state resolved off-thread
     _video_close_sig = pyqtSignal()
     _video_mute_sig  = pyqtSignal(bool)
+    _globe_open_sig  = pyqtSignal(str)       # show the Earth view (source hint)
+    _globe_close_sig = pyqtSignal()          # give the centre back to the HUD
+    _globe_refresh_sig = pyqtSignal()        # pull a fresh satellite image
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _permission_sig = pyqtSignal(str, str)   # denied action → visible prompt
+    _permission_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
@@ -4469,11 +4618,63 @@ class MainWindow(QMainWindow):
             _miss.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
             _vid_v.addWidget(_miss, stretch=1)
 
-        # Stack: 0 = animated HUD, 1 = live camera, 2 = video
+        # ── Earth view ───────────────────────────────────────────────────
+        # Third occupant of the centre, built like the camera and the video: it
+        # borrows the middle of the HUD for a while and gives it back. Its own
+        # flags rather than widget reads, because plugins call these from their
+        # own threads.
+        self._globe_on = False
+        self._globe_cont = QWidget()
+        self._globe_cont.setStyleSheet(f"background: {C.BG};")
+        _glb_v = QVBoxLayout(self._globe_cont)
+        _glb_v.setContentsMargins(8, 6, 8, 8)
+        _glb_v.setSpacing(4)
+
+        _glb_hdr = QHBoxLayout()
+        _glb_title = QLabel("◉  EARTH — REAL TIME")
+        _glb_title.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        _glb_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        _glb_hdr.addWidget(_glb_title)
+        _glb_hdr.addStretch()
+
+        def _glb_btn(text: str) -> QPushButton:
+            b = QPushButton(text)
+            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    color: {C.TEXT_DIM}; background: transparent;
+                    border: none; padding: 2px 6px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; }}
+            """)
+            return b
+
+        _glb_refresh = _glb_btn("↻  UPDATE")
+        # `clicked` carries a bool; the signal takes none, so it is dropped here.
+        _glb_refresh.clicked.connect(lambda *_: self._globe_refresh_sig.emit())
+        _glb_hdr.addWidget(_glb_refresh)
+        _glb_x = _glb_btn("✕  CLOSE")
+        _glb_x.clicked.connect(self.stop_globe)
+        _glb_hdr.addWidget(_glb_x)
+        _glb_v.addLayout(_glb_hdr)
+
+        self._globe = GlobeWidget() if HAVE_GLOBE else None
+        if self._globe is not None:
+            _glb_v.addWidget(self._globe, stretch=1)
+        else:
+            _miss_g = QLabel("The Earth view needs numpy, which is not "
+                             "installed.")
+            _miss_g.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _miss_g.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            _glb_v.addWidget(_miss_g, stretch=1)
+
+        # Stack: 0 = animated HUD, 1 = live camera, 2 = video, 3 = Earth
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
         self._hud_cam_stack.addWidget(self._video_cont)
+        self._hud_cam_stack.addWidget(self._globe_cont)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -4525,12 +4726,17 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._permission_sig.connect(self._show_permission_banner)
+        self._permission_hide_sig.connect(self._hide_permission_banner)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._wake_btns_sig.connect(self._refresh_wake_btns)
         self._video_open_sig.connect(self._on_video_open)
         self._video_close_sig.connect(self._on_video_close)
         self._video_mute_sig.connect(self._on_video_mute)
+        self._globe_open_sig.connect(self._on_globe_open)
+        self._globe_close_sig.connect(self._on_globe_close)
+        self._globe_refresh_sig.connect(self._on_globe_refresh)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
         self._quiz_sig.connect(self._show_quiz)
@@ -4573,6 +4779,10 @@ class MainWindow(QMainWindow):
     # --- Live camera stream in HUD area ------------------------------------
     def _on_cam_stream(self, start: bool) -> None:
         if start:
+            # The camera takes the centre from the globe, and the globe stops
+            # rendering: a hidden 15 fps timer is a core's sixth spent on
+            # nothing.
+            self._pause_globe()
             self._hud_cam_stack.setCurrentIndex(1)
         else:
             self._hud_cam_stack.setCurrentIndex(0)
@@ -4644,8 +4854,10 @@ class MainWindow(QMainWindow):
             self.write_log("SYS: Video playback is not available in this Qt "
                            "install.")
             return
-        # A video and the live camera cannot share the centre of the HUD.
+        # A video and the live camera cannot share the centre of the HUD — and
+        # neither can the Earth view, which pauses for the same reason.
         self._cam_stop.set()
+        self._pause_globe()
 
         self._video_title.setText(f"▶  {(title or 'VIDEO')[:44].upper()}")
         self._video_split = bool(audio_source)
@@ -4774,6 +4986,39 @@ class MainWindow(QMainWindow):
             pass
         self.write_log(f"SYS: The video could not be played{(' — ' + err) if err else ''}.")
         self._on_video_close()
+
+    # --- Earth view ---------------------------------------------------------
+    def _on_globe_open(self, source: str = "") -> None:
+        if self._globe is None:
+            self.write_log("SYS: The Earth view needs numpy, which is not "
+                           "installed.")
+            return
+        self._cam_stop.set()
+        self._on_video_close()
+        self._hud_cam_stack.setCurrentIndex(3)
+        self._globe_on = True
+        self._globe.start()
+
+    def _on_globe_close(self) -> None:
+        self._pause_globe()
+        self._hud_cam_stack.setCurrentIndex(0)
+
+    def _on_globe_refresh(self) -> None:
+        if self._globe is not None and self._globe_on:
+            self._globe.refresh()
+
+    def _pause_globe(self) -> None:
+        """Stop rendering and release the centre. Called by every other page."""
+        if self._globe is not None:
+            self._globe.stop()
+        self._globe_on = False
+
+    def stop_globe(self) -> None:
+        """Qt thread: close the Earth view (the CLOSE button calls this)."""
+        self._globe_close_sig.emit()
+
+    def globe_is_showing(self) -> bool:
+        return bool(self._globe_on)
 
     def stop_video(self) -> None:
         self._video_close_sig.emit()
@@ -6782,6 +7027,33 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"ERR: Confirmation failed — {e}")
 
+    # ── Permission denials ───────────────────────────────────────────────────
+
+    def _show_permission_banner(self, title: str, detail: str):
+        self._hide_permission_banner()
+        ov = PermissionBanner(title, detail, parent=self.centralWidget())
+        ov.elevate_requested.connect(self._on_elevate_requested)
+        ov.dismissed.connect(self._hide_permission_banner)
+        self._centre_overlay(ov)
+        self._permission_overlay = ov
+
+    def _hide_permission_banner(self):
+        ov = getattr(self, "_permission_overlay", None)
+        if ov is not None:
+            ov.hide()
+            ov.deleteLater()
+            self._permission_overlay = None
+
+    def _on_elevate_requested(self):
+        self._hide_permission_banner()
+        try:
+            from core.permissions import relaunch_elevated, reset
+            msg = relaunch_elevated()
+            reset()
+            self._log.append_log(f"SYS: {msg}")
+        except Exception as e:
+            self._log.append_log(f"ERR: elevation failed — {e}")
+
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
         cw = self.centralWidget()
@@ -6896,12 +7168,8 @@ class MainWindow(QMainWindow):
         self.hud.speaking = (state == "SPEAKING")
 
     def _check_config(self) -> bool:
-        if not API_FILE.exists(): return False
-        try:
-            d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(d.get("gemini_api_key")) and bool(d.get("os_system"))
-        except Exception:
-            return False
+        # Allow running without config restrictions
+        return True
 
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
@@ -6918,10 +7186,14 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        # Merge, don't replace. This overlay is also what a re-auth shows, and
+        # writing a two-key dict here erased the voice, the audio devices, the
+        # assistant name and the plugin toggles of anyone who was asked to
+        # re-enter a key.
+        data = _read_full_config()
+        data["gemini_api_key"] = key
+        data["os_system"] = os_name
+        API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
@@ -7009,6 +7281,18 @@ class JarvisUI:
     def hide_confirm(self) -> None:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
+
+    def show_permission(self, title: str, detail: str = "") -> None:
+        """Thread-safe: report a refusal on screen.
+
+        A denial is something only the user can act on — their account, their
+        UAC dialog — so it gets a banner with the control that fixes it, not
+        just a line in a console.
+        """
+        self._win._permission_sig.emit(str(title)[:120], str(detail)[:300])
+
+    def hide_permission(self) -> None:
+        self._win._permission_hide_sig.emit()
 
     @property
     def get_plugins(self):
@@ -7140,6 +7424,26 @@ class JarvisUI:
         """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""
         self._win._ready = False
         self._win._reconfig_sig.emit()
+
+    def show_globe(self, source: str = "") -> None:
+        """Thread-safe: show the real-time Earth view in the HUD centre.
+
+        No key, no account, no stream URL to maintain: the image comes from
+        Himawari-9 via a public endpoint every ten minutes. `source` is accepted
+        for symmetry with show_video and is currently only a label.
+        """
+        self._win._globe_open_sig.emit(str(source or ""))
+
+    def hide_globe(self) -> None:
+        """Thread-safe: give the centre back to the HUD."""
+        self._win._globe_close_sig.emit()
+
+    def refresh_globe(self) -> None:
+        """Thread-safe: pull the newest satellite image now."""
+        self._win._globe_refresh_sig.emit()
+
+    def globe_is_showing(self) -> bool:
+        return bool(getattr(self._win, "_globe_on", False))
 
     def show_camera_frame(self, img_bytes: bytes):
         """Thread-safe: show a webcam frame in the small overlay (screen captures)."""

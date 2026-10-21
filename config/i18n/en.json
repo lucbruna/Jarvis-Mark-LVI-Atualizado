@@ -1,0 +1,12 @@
+{
+  "app": {
+    "name": "JARVIS",
+    "listening": "Listening",
+    "speaking": "Speaking",
+    "thinking": "Thinking"
+  },
+  "errors": {
+    "no_mic": "No microphone detected",
+    "no_camera": "No camera detected"
+  }
+}

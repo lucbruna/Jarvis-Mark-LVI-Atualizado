@@ -77,6 +77,56 @@ def strip_meta(decls):
     return out
 
 
+def _repair_schema(node, path: str, repairs: list) -> object:
+    """Copy of `node` with every ARRAY that lacks `items` given one."""
+    if isinstance(node, list):
+        return [_repair_schema(v, f"{path}[{i}]", repairs)
+                for i, v in enumerate(node)]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _repair_schema(v, f"{path}.{k}", repairs) for k, v in node.items()}
+    kind = out.get("type")
+    if isinstance(kind, str) and kind.upper() == "ARRAY" and "items" not in out:
+        out["items"] = {"type": "STRING"}
+        repairs.append(path or "<parameters>")
+    return out
+
+
+def sanitize_declarations(decls):
+    """Declarations a vendor will actually accept.
+
+    WHY THIS EXISTS
+        Gemini validates the WHOLE function-declaration set when the Live
+        session is set up, and rejects the setup with a 1007 if ANY array is
+        missing `items`:
+
+            setup.tools[0].function_declarations[36].parameters
+                .properties[measures].items: missing field.
+
+        One plugin author forgetting a single line therefore costs the whole
+        assistant, not that one tool — and because the failure is a WebSocket
+        1007, it used to be reported as an invalid API key. Fixing the
+        declaration is still the right thing to do (a typed `items` is what
+        makes the model fill the field correctly); this is the net under it, so
+        the next one costs a log line instead of the session.
+
+    Returns new objects; every string and value is copied unchanged, so a
+    declaration that was already valid reaches the API byte-for-byte identical.
+    """
+    out, repairs = [], []
+    for decl in decls:
+        if isinstance(decl, dict):
+            name = decl.get("name") or "<unnamed>"
+            out.append({k: (_repair_schema(v, f"{name}.{k}", repairs)
+                            if k == "parameters" else v)
+                        for k, v in decl.items()})
+        else:
+            out.append(decl)
+    for path in repairs:
+        print(f"[Actions] repaired schema without `items`: {path}")
+    return out
+
+
 def _opt_upper(value, allowed: tuple[str, ...]) -> Optional[str]:
     v = str(value or "").strip().upper()
     return v if v in allowed else None

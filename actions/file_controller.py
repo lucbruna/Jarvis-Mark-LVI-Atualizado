@@ -95,7 +95,16 @@ _SAFE_ROOTS: list[Path] = [
 ]
 
 def _is_safe_path(target: Path) -> bool:
-    """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
+    """Is the given path inside _SAFE_ROOTS? If not, reject the operation.
+
+    In unrestricted mode every path is allowed.
+    """
+    try:
+        from memory.config_manager import get_unrestricted_mode
+        if get_unrestricted_mode():
+            return True
+    except Exception:
+        pass
     try:
         resolved = target.resolve()
         return any(
@@ -276,12 +285,18 @@ def delete_file(path: str, name: str = "") -> str:
             return f"Not found: {target.name}"
 
         # Safe-directory check — protect critical user folders
-        protected = {
-            _get_desktop(), _get_downloads(), _get_documents(),
-            _get_pictures(), _get_music(), _get_videos(), Path.home()
-        }
-        if target.resolve() in {p.resolve() for p in protected}:
-            return f"Protected directory, cannot delete: {target.name}"
+        try:
+            from memory.config_manager import get_unrestricted_mode
+            _unlocked = get_unrestricted_mode()
+        except Exception:
+            _unlocked = False
+        if not _unlocked:
+            protected = {
+                _get_desktop(), _get_downloads(), _get_documents(),
+                _get_pictures(), _get_music(), _get_videos(), Path.home()
+            }
+            if target.resolve() in {p.resolve() for p in protected}:
+                return f"Protected directory, cannot delete: {target.name}"
 
         original = target.resolve()
         result   = _safe_trash(target)

@@ -48,3 +48,12 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# Large binaries
+*.exe
+providers/voices/*.onnx
+Torvis-setup.exe
+
+# installer patches with secrets
+installer_patched.py
+patch_torvis.ps1

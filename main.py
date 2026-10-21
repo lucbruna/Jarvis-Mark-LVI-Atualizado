@@ -63,7 +63,7 @@ from memory.memory_manager import (
 # (screen_process, close_camera, save_memory, manage_monitor, shutdown_jarvis,
 # system_status).
 from core import outcome
-from core.action_loader import strip_meta
+from core.action_loader import strip_meta, sanitize_declarations
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
@@ -80,8 +80,10 @@ from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
+from core                      import permissions as permission_gate
 from core                      import audio_devices
 from core.action_loader        import discover_actions
+from core.hotreload            import FileWatcher
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
 from core.wake_word            import (
@@ -575,7 +577,15 @@ class JarvisLive:
         # Platform limits are announced once per run, not once per
         # reconnect: a dropped connection is not news about Wayland.
         self._platform_notes_shown = False
+        # A machine with no microphone is a configuration problem, not a
+        # reason to tear down the Live session. Announced once per run.
+        self._no_mic_announced = False
         self.ui             = ui
+        try:
+            from core.updater import start_background
+            start_background(ui=self.ui, interval=86400.0)
+        except Exception:
+            pass
         self._asst_name     = "JARVI    S"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -590,6 +600,11 @@ class JarvisLive:
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
+        # Gemini Live rejects every sendRealtimeInput frame while a tool call is
+        # pending. The mic task keeps producing audio in parallel with the
+        # receive/tool task, so without this gate the server closes the socket
+        # with 1008 (policy violation): "The operation was aborted."
+        self._tool_call_pending    = False
         # Which engine is holding the conversation, and what it can do.
         # None means Gemini Live — the default and, unless somebody has gone to
         # the providers settings and chosen otherwise, always the case. Every
@@ -685,8 +700,40 @@ class JarvisLive:
             notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
-        self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
+        self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # �sT settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+
+        # Hot-reload: watch actions/ and plugins/ for changes and rediscover.
+        try:
+            _base = Path(__file__).resolve().parent
+            self._tools_lock = threading.Lock()
+
+            def _reload_tools():
+                with self._tools_lock:
+                    try:
+                        self._action_registry = discover_actions(
+                            actions_dir=_base / "actions",
+                            reserved_names=_inline_names,
+                            logger=lambda msg: print(f"[Actions] {msg}"),
+                        )
+                        _cn = _inline_names | self._action_registry.names()
+                        self._plugin_registry = discover_plugins(
+                            plugins_dir=_base / "plugins",
+                            core_tool_names=_cn,
+                            logger=lambda msg: print(f"[Plugins] {msg}"),
+                            notify=lambda msg: self.ui.write_log(f"SYS: {msg}"),
+                        )
+                        self.ui.get_plugins = self._plugin_registry.list_for_ui
+                        self.ui.get_plugin_settings = self._plugin_registry.settings_schemas
+                        print("[HotReload] tools reloaded")
+                    except Exception as e:
+                        print(f"[HotReload] reload failed: {e}")
+
+            self._hotreload = FileWatcher(
+                [_base / "actions", _base / "plugins"], _reload_tools, interval=5.0)
+            self._hotreload.start()
+        except Exception as e:
+            print(f"[HotReload] could not start: {e}")
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -811,6 +858,14 @@ class JarvisLive:
         """
         loop = getattr(self, "_loop", None)
         if not loop or not self.session:
+            return
+
+        # A client-content turn sent while Gemini is waiting for a tool
+        # response can cancel that tool call; the subsequent send_tool_response
+        # is then invalid. The tool result itself is the safe speech channel, so
+        # suppress this side-channel for the duration of the tool call.
+        if self._tool_call_pending:
+            print("[PluginSay] suppressed while a tool call is pending")
             return
 
         async def _say():
@@ -1185,7 +1240,11 @@ class JarvisLive:
             # validation error, not something the API ignores. A declaration
             # that carries neither comes back as the same object, so what
             # Gemini receives is unchanged from the previous release.
-            tools=[{"function_declarations": strip_meta(_all_decls)}],
+            # strip_meta drops the local `tier`/`brief` keys; sanitize_declarations
+            # guarantees the surviving schema is one Gemini will accept, so a
+            # single plugin with an untyped ARRAY cannot fail the whole session.
+            tools=[{"function_declarations":
+                    sanitize_declarations(strip_meta(_all_decls))}],
             # Asks the server to issue session-resumption handles. Enabled but
             # NOT yet used: no handle is captured from the resumption update and
             # none is passed back here, so a reconnect starts a fresh session
@@ -1302,6 +1361,7 @@ class JarvisLive:
 
         loop   = asyncio.get_event_loop()
         result = "Done."
+        _tool_exc = None
 
         try:
             if name == "recall_memory":
@@ -1426,6 +1486,7 @@ class JarvisLive:
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
+            _tool_exc = e
             traceback.print_exc()
             self.speak_error(name, e)
 
@@ -1434,6 +1495,10 @@ class JarvisLive:
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
 
+        # A refusal is reported here rather than at each of the twenty-odd
+        # places that can produce one, so a new action cannot forget to do it.
+        # Cheap on success: one substring scan of a short string.
+        permission_gate.note(name, result, exc=_tool_exc)
         # A tool that declared itself NON_BLOCKING also says when its answer may
         # re-enter the conversation. Without this the model finishes whatever it
         # was saying and then reads the result out on top of it — which, for
@@ -1452,6 +1517,16 @@ class JarvisLive:
     async def _send_realtime(self):
         while True:
             msg = await self.out_queue.get()
+
+            # While the model is waiting for a tool response, ANY realtime input
+            # is a protocol violation and the server closes the WebSocket with
+            # 1008. The mic callback and the phone relay keep filling the queue
+            # during a slow tool (confirmation, process kill, command runner), so
+            # drop those frames here instead of sending them. They are stale by
+            # the time the tool finishes anyway.
+            if self._tool_call_pending:
+                continue
+
             # Gemini 3.x Live rejects the old realtime_input.media_chunks field
             # (what `media=...` maps to) and closes the socket with a 1007. Send
             # mic / phone PCM through the new `audio` field instead. Queue items
@@ -1529,6 +1604,20 @@ class JarvisLive:
                 return
             
             if not self.ui.muted and not self._phone_active:
+                # Drop blocks that are just room noise so they never reach the
+                # model or the wake word. See core/noise_gate.
+                try:
+                    from core.noise_suppress import enabled as _ns_enabled, process as _ns_process
+                    if _ns_enabled():
+                        indata = _ns_process(indata)
+                except Exception:
+                    pass
+                try:
+                    from core.noise_gate import gate as _noise_gate
+                    if not _noise_gate(indata):
+                        return
+                except Exception:
+                    pass
                 data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
@@ -1542,17 +1631,17 @@ class JarvisLive:
                 except Exception:
                     pass
 
-        try:
-            def _open_mic(dev):
-                return sd.InputStream(
-                    samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype="int16",
-                    blocksize=CHUNK_SIZE,
-                    device=dev,
-                    callback=callback,
-                )
+        def _open_mic(dev):
+            return sd.InputStream(
+                samplerate=SEND_SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=dev,
+                callback=callback,
+            )
 
+        def _open_configured_mic():
             # Which microphone. resolve() returns None for "system default" and
             # for a saved device that is no longer present — so a headset
             # unplugged since the last run falls back to the built-in mic
@@ -1562,7 +1651,7 @@ class JarvisLive:
             if _mic_dev is not None:
                 print(f"[JARVIS] 🎤 Input device: {_mic_name}")
             try:
-                _mic_stream = _open_mic(_mic_dev)
+                return _open_mic(_mic_dev)
             except Exception as _e:
                 # A device the picker listed but the driver will not open right
                 # now — exclusive mode, a webcam already in use, a virtual mic
@@ -1574,15 +1663,57 @@ class JarvisLive:
                 self.ui.write_log(
                     f"SYS: Microphone '{_mic_name}' unavailable — using system default."
                 )
-                _mic_stream = _open_mic(None)
+                return _open_mic(None)
 
-            with _mic_stream:
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
-            raise
+        async def _announce_missing_mic(error):
+            """No input device must not take the session down.
+
+            A machine with no microphone used to raise from here, which killed
+            the TaskGroup and made the assistant reconnect in a loop — online,
+            then gone, then online — while the log only ever said "sleeping".
+            Speech still works in the other direction, so the session stays up,
+            the user is told once (in Portuguese, the language they use), and
+            the device is retried until a headset is plugged in.
+            """
+            if self._no_mic_announced:
+                return
+            self._no_mic_announced = True
+            print(f"[JARVIS] ❌ No microphone available: {error}")
+            self.ui.write_log(
+                "SYS: Nenhum microfone detectado — conecte um microfone "
+                "(ou libere o acesso no Windows). Vou continuar tentando."
+            )
+            # Say it out loud as well: with no microphone this is the only
+            # proof the user gets that the assistant is alive and its voice
+            # path works.
+            try:
+                if self.session:
+                    await self.session.send_client_content(
+                        turns={"role": "user", "parts": [{"text":
+                            "[AVISO DO SISTEMA] Nenhum microfone foi encontrado "
+                            "neste computador. Diga ao usuário, em português do "
+                            "Brasil, que você está online e consegue falar, mas "
+                            "não consegue ouvi-lo até que um microfone seja "
+                            "conectado. Uma frase curta e pare."}]},
+                        turn_complete=True,
+                    )
+            except Exception as e:
+                print(f"[JARVIS] Could not announce missing mic: {e}")
+
+        while True:
+            try:
+                _mic_stream = _open_configured_mic()
+                with _mic_stream:
+                    print("[JARVIS] 🎤 Mic stream open")
+                    while True:
+                        await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # No device at all, or the one we had went away. Wait for
+                # hardware rather than reconnecting the whole conversation.
+                await _announce_missing_mic(e)
+                await asyncio.sleep(5)
 
     async def _flush_pending_vision(self) -> bool:
         """Send a captured frame immediately after its tool response.
@@ -1747,15 +1878,27 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
-                        await self._flush_pending_vision()
+                        # Gemini Live enters a mode where it rejects every
+                        # sendRealtimeInput frame until it receives the tool
+                        # response. Set this BEFORE executing anything: tools can
+                        # take seconds (confirmation dialogs, process kills) and
+                        # the mic task would otherwise close the socket with 1008.
+                        self._tool_call_pending = True
+                        try:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                print(f"[JARVIS] Tool call: {fc.name}")
+                                fr = await self._execute_tool(fc)
+                                fn_responses.append(fr)
+                            await self.session.send_tool_response(
+                                function_responses=fn_responses
+                            )
+                            # Vision injects client content after the tool
+                            # response; keep the mic gated until that turn is
+                            # handed over so it cannot interleave with the image.
+                            await self._flush_pending_vision()
+                        finally:
+                            self._tool_call_pending = False
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
@@ -2350,6 +2493,12 @@ class JarvisLive:
             hide = self.ui.hide_confirm,
             log  = self.ui.write_log,
         )
+        # Denials arrive as ordinary tool RESULTS, so they have no other route
+        # to the screen: every result passes through note() a moment later.
+        permission_gate.bind(
+            show = self.ui.show_permission,
+            log  = self.ui.write_log,
+        )
         set_trim_notifier(self.ui.write_log)
 
         # Tell the device picker the exact rates the streams open at, from the
@@ -2431,6 +2580,7 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._tool_call_pending    = False
 
                     print("[JARVIS] Connected.")
                     if _resumed_with:
@@ -2590,15 +2740,47 @@ class JarvisLive:
                     )
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
+                # Invalid API key — stop hammering the API, prompt re-configuration.
+                #
+                # Keyed on what the server SAYS, not on the WebSocket close code.
+                # 1007 is "invalid frame payload" and Gemini reuses it for ANY
+                # setup it refuses — a malformed tool declaration, a field this
+                # model does not take — so reading the code alone as an auth
+                # failure sent people to re-type a key that was already working
+                # (and overwrote the rest of their config doing it). A genuinely
+                # bad key closes with the same 1007, but says "API key not
+                # valid" / "invalid API key" in the reason (measured: a revoked
+                # key closes with 1008, a rejected tool schema with 1007 — the
+                # code alone never distinguished them), which is what is
+                # checked here.
+                _low = err_str.lower()
+                if ("api key not valid" in _low or "api_key_invalid" in _low
+                        or "api key expired" in _low
+                        or "invalid api key" in _low):
                     self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                     self.ui.set_state("SLEEPING")
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
+                    # Drop the cached copy so every plugin and action uses the
+                    # key that was just typed, not the one read at startup.
+                    try:
+                        _gemini.api_key(refresh=True)
+                    except Exception:
+                        pass
                     print("[JARVIS] New API key saved — reconnecting...")
                     _conn_backoff = 3
+                    continue
+
+                # A setup the server refused for a non-credential reason. It is
+                # not the key, so do not ask for one: print the server's own
+                # sentence, which names the offending field or tool.
+                if "1007" in err_str or "1008" in err_str:
+                    self.ui.write_log(
+                        "ERR: the Live session was rejected — the reason is in "
+                        "the console."
+                    )
+                    print(f"[JARVIS] Live setup rejected: {err_str[:400]}")
                     continue
 
                 # Network / timeout errors — log clearly and back off

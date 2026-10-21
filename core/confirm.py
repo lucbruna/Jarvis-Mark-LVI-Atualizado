@@ -87,12 +87,22 @@ def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
     rather than reading an English string verbatim."""
     global _pending
 
+    # In unrestricted mode, skip the human gate and run immediately.
+    try:
+        from memory.config_manager import get_unrestricted_mode
+        if get_unrestricted_mode():
+            try:
+                return (run() or "Done.")
+            except Exception as e:  # noqa: BLE001
+                return f"Failed: {e}"
+    except Exception:
+        pass
+
     if _show_cb is None:
         # No interface bound (headless, or a very early call). Refuse rather
         # than silently performing something irreversible.
         return (f"I cannot confirm '{title}' right now because the interface is "
                 f"not available, so I have not done it.")
-
     with _lock:
         _pending = _Pending(key=key, title=title, detail=detail,
                             run=run, at=time.monotonic())

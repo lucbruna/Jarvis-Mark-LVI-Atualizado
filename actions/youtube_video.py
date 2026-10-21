@@ -15,23 +15,25 @@ try:
 except ImportError:
     _PYAUTOGUI = False
 
-try:
-    import numpy as np
-    _NUMPY = True
-except ImportError:
-    _NUMPY = False
+from importlib.util import find_spec as _find_spec
 
-try:
+# Checked without importing: `import` runs the whole module, which on this one
+# pulls in onnxruntime-sized transitive work and froze the settings drawer for
+# 2.1s. find_spec answers "is it installed?" without executing anything, and
+# the real import happens on first use.
+_REQUESTS_OK = _find_spec("requests") is not None
+_NUMPY = _find_spec("numpy") is not None
+_TRANSCRIPT_OK = _find_spec("youtube_transcript_api") is not None
+
+
+def _requests():
     import requests
-    _REQUESTS_OK = True
-except ImportError:
-    _REQUESTS_OK = False
+    return requests
 
-try:
+
+def _transcript_api():
     from youtube_transcript_api import YouTubeTranscriptApi
-    _TRANSCRIPT_OK = True
-except ImportError:
-    _TRANSCRIPT_OK = False
+    return YouTubeTranscriptApi
 
 from config import get_os, is_windows, is_mac, is_linux
 
@@ -85,7 +87,7 @@ def _scrape_first_video_url(query: str) -> str | None:
     )
 
     try:
-        r    = requests.get(search_url, headers=HEADERS, timeout=10)
+        r    = _requests().get(search_url, headers=HEADERS, timeout=10)
         html = r.text
 
         video_ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html)
@@ -137,7 +139,7 @@ def _get_transcript(video_id: str) -> str | None:
     if not _TRANSCRIPT_OK:
         return None
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = _transcript_api().list_transcripts(video_id)
         transcript      = None
 
         lang_priority = ["en", "tr", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "ar", "zh"]
@@ -227,7 +229,7 @@ def _scrape_video_info(video_id: str) -> dict:
         return {}
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        r    = requests.get(url, headers=HEADERS, timeout=12)
+        r    = _requests().get(url, headers=HEADERS, timeout=12)
         html = r.text
         info = {}
 
@@ -260,7 +262,7 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         return []
     url = f"https://www.youtube.com/feed/trending?gl={region.upper()}"
     try:
-        r    = requests.get(url, headers=HEADERS, timeout=12)
+        r    = _requests().get(url, headers=HEADERS, timeout=12)
         html = r.text
 
         titles   = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"\}\]', html)

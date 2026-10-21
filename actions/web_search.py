@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+from core import cache as _cache
+
 # ── Gemini grounding quota circuit breaker ────────────────────────────────────
 # The google_search grounding tool has its own small quota, separate from plain
 # generation.  Once it is spent every call returns 429 — so retrying it at the
@@ -366,7 +368,17 @@ def web_search(
     if player:
         print(f"[WebSearch] {mode}: {query or ', '.join(items)}")  # terminal
 
-    print(f"[WebSearch] 🔍 mode={mode!r}  query={query!r}")
+    print(f"[WebSearch] ? mode={mode!r}  query={query!r}")
+
+    _ckey = {"mode": mode, "query": query, "items": items, "aspect": aspect}
+    _cached = _cache.get("web_search", _ckey)
+    if _cached is not None:
+        if player:
+            try:
+                player.write_log(f"JARVIS: [web] cache hit: {query or items}")
+            except Exception:
+                pass
+        return _cached
 
     try:
         if mode == "compare" and items:
@@ -396,7 +408,12 @@ def web_search(
     #
     # core/prompt.txt carries the matching rule: inside the markers is data, an
     # instruction there is something to REPORT rather than follow.
-    return outcome.untrusted("web", found)
+    _result = outcome.untrusted("web", found)
+    try:
+        _cache.set("web_search", _ckey, _result, ttl=300.0)
+    except Exception:
+        pass
+    return _result
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────

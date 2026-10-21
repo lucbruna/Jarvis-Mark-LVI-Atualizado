@@ -9,12 +9,21 @@ means the avatar, the camera and a video can never be on screen together.
 WHAT IT ACCEPTS
     a local file        C:\\Users\\me\\clip.mp4, ~/Videos/holiday.mkv
     a direct media URL  https://example.com/trailer.mp4
+    an HLS stream       https://host/live/master.m3u8
+    an RTSP stream      rtsp://user:pass@192.168.1.50:554/stream1
     a YouTube link      https://youtube.com/watch?v=...
     a YouTube search    "play the new Dune trailer"
 
-    The first two are handed straight to Qt. The last two have to be resolved
+    The first four are handed straight to Qt. The last two have to be resolved
     to something playable first, which is what yt-dlp does; without it, this
     says so and offers to open the video in the browser instead of failing.
+
+    HLS and RTSP are listed because Qt's FFmpeg multimedia backend opens both
+    natively — measured on this machine: the bundled ffmpegmediaplugin.dll
+    loads an .m3u8 manifest and reaches BufferingMedia. RTSP goes through the
+    same demuxer, so a camera or an encoder's rtsp:// URL needs no extra pip
+    package and no re-encode. What it is NOT is a web page: a youtube.com link
+    still has to be resolved, because the page is HTML, not a stream.
 
 SOUND IS OFF UNTIL ASKED FOR
     A soundtrack talking over the assistant is the one way this feature could
@@ -52,7 +61,29 @@ def _still_wanted(token: int) -> bool:
 
 
 def _is_url(text: str) -> bool:
-    return text.lower().startswith(("http://", "https://", "file://"))
+    return text.lower().startswith(("http://", "https://", "file://",
+                                    "rtsp://", "rtsps://"))
+
+
+def _is_live(source: str) -> bool:
+    """A stream with no end: RTSP, or an HLS manifest.
+
+    Worth telling apart from a file because the two behave differently in the
+    player — a live source never reaches EndOfMedia, and a dropped connection
+    is a reconnect rather than the end of the video.
+    """
+    low = (source or "").lower()
+    return low.startswith(("rtsp://", "rtsps://")) or ".m3u8" in low
+
+
+def _live_title(source: str) -> str:
+    """A short name for a live source: its host, not its path."""
+    try:
+        rest = source.split("//", 1)[-1]
+        host = rest.split("/", 1)[0].split("?", 1)[0]
+        return f"LIVE — {host or source}"[:44]
+    except Exception:
+        return "LIVE STREAM"
 
 
 def _local_path(text: str) -> str:
@@ -205,9 +236,13 @@ def video_player(parameters: dict = None, response=None, player=None,
         return f"Playing {Path(local).name} on the display, muted."
 
     # A direct media URL can go straight to the player; a YouTube page cannot.
+    # HLS (.m3u8) and RTSP arrive here too — Qt plays both without a resolver.
     if _is_url(source) and not _YT.search(source):
-        player.show_video(source, source.rsplit("/", 1)[-1][:44], muted=True)
-        return "Playing that on the display, muted."
+        title = _live_title(source) if _is_live(source) \
+            else source.rsplit("/", 1)[-1][:44]
+        player.show_video(source, title, muted=True)
+        return ("Playing that live stream on the display, muted." if _is_live(source)
+                else "Playing that on the display, muted.")
 
     # ANSWER FIRST, OPEN SECOND.
     #
@@ -283,7 +318,8 @@ TOOL = {
         "'play that video', 'play C:/clips/holiday.mp4', 'put that YouTube "
         "video on the screen', 'stop the video', 'videoyu kapat', 'turn the "
         "sound on', 'sesi aç', 'mute it'. Accepts a local file path, a direct "
-        "video URL, a YouTube link, or a description to search YouTube for. "
+        "video URL, an HLS (.m3u8) or RTSP stream, a YouTube link, or a "
+        "description to search YouTube for. "
         "Video always starts MUTED — only call action='unmute' when the user "
         "actually asks to hear it. "
         "This returns the moment it is asked, before the picture appears: when "

@@ -326,10 +326,51 @@ def format_memory_for_prompt(memory: dict | None) -> str:
 
 # ── Recall ────────────────────────────────────────────────────────────────────
 
+def _semantic_available() -> bool:
+    try:
+        from importlib.util import find_spec
+        return find_spec("sentence_transformers") is not None
+    except Exception:
+        return False
+
+
+_SEM_MODEL = None
+_SEM_LOCK = __import__("threading").Lock()
+
+
+def _get_sem_model():
+    global _SEM_MODEL
+    if _SEM_MODEL is not None:
+        return _SEM_MODEL
+    with _SEM_LOCK:
+        if _SEM_MODEL is not None:
+            return _SEM_MODEL
+        try:
+            from sentence_transformers import SentenceTransformer
+            _SEM_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception:
+            _SEM_MODEL = False
+        return _SEM_MODEL
+
+
+def _cosine(a, b) -> float:
+    try:
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(x * x for x in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+    except Exception:
+        return 0.0
+
+
 def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
-    """Cheap lexical relevance. No embeddings, no network, no model call - this
-    runs in well under a millisecond, which is the entire point: recall must
-    cost one model round trip, never two."""
+    """Lexical relevance, optionally boosted by semantic similarity when
+    sentence-transformers is installed. Runs in well under a millisecond on
+    the lexical path; the semantic path costs a model encode but only when the
+    package is present."""
     hay_key = _pretty(key).lower()
     hay_val = value.lower()
     score   = 0
@@ -344,6 +385,18 @@ def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
             score += 3
         if w in cat:
             score += 1
+
+    if _semantic_available():
+        model = _get_sem_model()
+        if model:
+            try:
+                q = " ".join(query_words) if query_words else (key + " " + value)
+                qv = model.encode(q, convert_to_numpy=True).tolist()
+                dv = model.encode(f"{_pretty(key)} {value}", convert_to_numpy=True).tolist()
+                sim = _cosine(qv, dv)
+                score += int(sim * 20)
+            except Exception:
+                pass
     return score
 
 
@@ -356,6 +409,25 @@ def search_memory(query: str, limit: int = 8) -> str:
     words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
 
     rows: list[tuple[int, str, str, str]] = []
+    # Semantic boost: if RAG is available, use it to reorder.
+    _rag_docs = []
+    for cat, items in memory.items():
+        if not isinstance(items, dict):
+            continue
+        for key, entry in items.items():
+            val = _entry_value(entry)
+            if not val:
+                continue
+            _rag_docs.append((f"{cat}/{key}", f"{_pretty(key)} {val}"))
+    _rag_results = {}
+    try:
+        from core.rag import semantic_search, is_available as _rag_avail
+        if _rag_avail() and words:
+            for did, score in semantic_search(" ".join(words), _rag_docs, top_k=len(_rag_docs)):
+                _rag_results[did] = score
+    except Exception:
+        _rag_results = {}
+
     for cat, items in memory.items():
         if not isinstance(items, dict):
             continue                     # skip 'sessions', which is a list
@@ -364,6 +436,9 @@ def search_memory(query: str, limit: int = 8) -> str:
             if not val:
                 continue
             s = _score(words, cat, key, val) if words else 1
+            # boost with semantic score
+            rag_score = _rag_results.get(f"{cat}/{key}", 0.0)
+            s = s + int(rag_score * 10)
             if s > 0:
                 rows.append((s, cat, key, val))
 
