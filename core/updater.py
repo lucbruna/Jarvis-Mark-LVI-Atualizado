@@ -10,7 +10,7 @@ import threading
 import time
 from urllib.request import urlopen
 
-_REPO = "FatihMakes/Mark-LVI"
+_REPO = "lucbruna/Jarvis-Mark-LVI-Atualizado"
 _INTERVAL = 24 * 3600  # daily
 
 
